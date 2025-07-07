@@ -1,116 +1,153 @@
 import os
-import time
-import requests
-from bs4 import BeautifulSoup
-from edge_tts import Communicate
-from requests_toolbelt.multipart.encoder import MultipartEncoder
-import subprocess
-import urllib.request
-import tarfile
-import re
+import datetime
 import asyncio
-from datetime import datetime
-import pytz
+import base64
+import subprocess
+import requests
+from google.genai import Client
+from google.genai.types import (
+    GenerateContentConfig,
+    SpeechConfig,
+    VoiceConfig,
+    PrebuiltVoiceConfig
+)
+from telethon import TelegramClient
+from telethon.tl.functions.messages import GetHistoryRequest
 
-# ⚙️ פרטי התחברות למערכת ימות המשיח
-USERNAME = "0733181201"
-PASSWORD = "6714453"
-TOKEN = f"{USERNAME}:{PASSWORD}"
-UPLOAD_PATH_PREFIX = "ivr2:/*/" # השלוחה *
+# =========== הגדרות קבועות ===========
+api_id = 24005590
+api_hash = "bb3d1bff42183fe39478ccf98d729cc6"
+channel_username = "calcalistcapitalmarkets"
+session_name = "session"
 
-# 🧾 שמות קבצים
-MP3_FILE = "news.mp3"
-WAV_FILE_TEMPLATE = "{:03}.wav"  # מספור בלבד: 000.wav, 001.wav וכו'
-FFMPEG_PATH = "./bin/ffmpeg"
+YEMOT_USERNAME = "0733181201"
+YEMOT_PASSWORD = "6714453"
+YEMOT_TOKEN = f"{YEMOT_USERNAME}:{YEMOT_PASSWORD}"
+YEMOT_UPLOAD_URL = "https://www.call2all.co.il/ym/api/UploadFile"
+TARGET_FOLDER = "ivr2:/4"
 
-# ✅ הורדת ffmpeg אם לא קיים
-def ensure_ffmpeg():
-    if not os.path.exists(FFMPEG_PATH):
-        print("⬇️ מוריד ffmpeg...")
-        os.makedirs("bin", exist_ok=True)
-        url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
-        archive_path = "bin/ffmpeg.tar.xz"
-        urllib.request.urlretrieve(url, archive_path)
-        with tarfile.open(archive_path) as tar:
-            for member in tar.getmembers():
-                if os.path.basename(member.name) == "ffmpeg":
-                    member.name = "ffmpeg"
-                    tar.extract(member, path="bin")
-        os.chmod(FFMPEG_PATH, 0o755)
+GEMINI_KEYS = [
+    "AIzaSyCNjsz1g2NPCxsfWyBfTmpD97bpSRA1qPA",
+    "AIzaSyBu_hgfv5YR9ZbJ4FK3-XmTPwp4ZkIGk38",
+    "AIzaSyD0Yi5Nl3whDBTlaCo-95EJNEertRPX-rA"
+]
 
-# ⏰ השגת השעה לפי שעון השרת
-def get_server_time():
-    now = datetime.now()
-    return now.strftime("%H:%M")
+VOICE_NAME = "Zubenelgenubi"
+OUTPUT_FOLDER = "audio"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+FFMPEG = "ffmpeg"
 
-# 🌐 שליפת ההודעה האחרונה מהערוץ
-def get_last_telegram_message(channel_username):
-    url = f"https://t.me/s/{channel_username}"
-    response = requests.get(url, verify=False)
-    if response.status_code != 200:
-        print("❌ שגיאה בגישה לערוץ.")
-        return None
-    soup = BeautifulSoup(response.text, 'html.parser')
-    messages = soup.find_all('div', class_='tgme_widget_message_text')
-    if not messages:
-        print("❌ לא נמצאו הודעות.")
-        return None
-    return messages[-1].get_text(strip=True)
+# =========== שליפת הודעה אחרונה ===========
+async def get_latest_message():
+    client = TelegramClient(session_name, api_id, api_hash)
+    await client.connect()
+    if not await client.is_user_authorized():
+        raise Exception("❌ לא מחובר לטלגרם – הפעל מקומית פעם אחת ליצירת session")
+    result = await client(GetHistoryRequest(
+        peer=channel_username,
+        limit=1,
+        offset_date=None,
+        offset_id=0,
+        max_id=0,
+        min_id=0,
+        add_offset=0,
+        hash=0
+    ))
+    await client.disconnect()
+    return result.messages[0].message.strip()
 
-# 🧠 הפקת קול
-async def create_voice(text):
-    communicate = Communicate(text=text, voice="he-IL-AvriNeural")
-    await communicate.save(MP3_FILE)
-
-# 🔄 המרה ל־WAV
-def convert_to_wav(wav_filename):
-    subprocess.run([FFMPEG_PATH, "-y", "-i", MP3_FILE, "-ar", "8000", "-ac", "1", "-acodec", "pcm_s16le", wav_filename])
-
-# ⬆️ העלאה לימות המשיח
-def upload_to_yemot(wav_filename):
-    with open(wav_filename, 'rb') as f:
-        m = MultipartEncoder(
-            fields={
-                'token': TOKEN,
-                'path': UPLOAD_PATH_PREFIX + os.path.basename(wav_filename),
-                'message': 'uploading',
-                'file': (os.path.basename(wav_filename), f, 'audio/wav')
-            }
-        )
-        response = requests.post('https://www.call2all.co.il/ym/api/UploadFile', data=m, headers={'Content-Type': m.content_type})
-        print("📤 הועלה לימות המשיח:", response.json())
-
-# 🧮 מציאת מספר קובץ פנוי
+# =========== יצירת שם קובץ ===========
 def get_next_filename():
-    i = 0
-    while True:
-        filename = WAV_FILE_TEMPLATE.format(i)
-        if not os.path.exists(filename):
-            return filename
-        i += 1
+    existing = [f for f in os.listdir(OUTPUT_FOLDER) if f.endswith(".wav")]
+    numbers = [int(f.split(".")[0]) for f in existing if f.split(".")[0].isdigit()]
+    next_number = max(numbers) + 1 if numbers else 0
+    return os.path.join(OUTPUT_FOLDER, f"{next_number:03}.wav")
 
-# 🚀 פונקציה ראשית לביצוע חד פעמי
-def run_once():
-    ensure_ffmpeg()
-    print("\n🕒 בודק הודעות חדשות...")
+# =========== שמירת RAW ===========
+def save_raw_pcm(path, data):
+    with open(path, "wb") as f:
+        f.write(data)
+
+# =========== המרה עם ffmpeg ===========
+def convert_raw_to_wav(raw_path, wav_path):
+    subprocess.run([
+        FFMPEG,
+        "-f", "s16le",
+        "-ar", "24000",
+        "-ac", "1",
+        "-i", raw_path,
+        "-ar", "8000",
+        "-ac", "1",
+        "-acodec", "pcm_s16le",
+        wav_path
+    ], check=True)
+
+# =========== יצירת שמע ===========
+def create_audio(text, wav_path):
+    for api_key in GEMINI_KEYS:
+        try:
+            client = Client(api_key=api_key)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-preview-tts",
+                contents=text,
+                config=GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=SpeechConfig(
+                        voice_config=VoiceConfig(
+                            prebuilt_voice_config=PrebuiltVoiceConfig(voice_name=VOICE_NAME)
+                        )
+                    )
+                )
+            )
+            audio_base64 = response.candidates[0].content.parts[0].inline_data.data
+            pcm = base64.b64decode(audio_base64)
+            raw_path = wav_path.replace(".wav", ".raw")
+            save_raw_pcm(raw_path, pcm)
+            convert_raw_to_wav(raw_path, wav_path)
+            print(f"✅ קובץ נוצר: {wav_path}")
+            return True
+        except Exception as e:
+            print(f"⚠️ שגיאה עם מפתח {api_key[:15]}...: {e}")
+    return False
+
+# =========== העלאה לימות ===========
+def upload_to_yemot(filepath):
+    with open(filepath, "rb") as f:
+        files = {
+            "token": (None, YEMOT_TOKEN),
+            "path": (None, f"{TARGET_FOLDER}/{os.path.basename(filepath)}"),
+            "file": (filepath, f, "audio/wav")
+        }
+        response = requests.post(YEMOT_UPLOAD_URL, files=files)
+        print("📤 תגובת ימות:", response.text)
+
+# =========== MAIN ===========
+async def main():
     try:
-        current = get_last_telegram_message("bullstreets_calcalist")
-        if current:
-            print("🆕 הודעה נמצאה!")
-            print("📄 תוכן:", current)
+        print("🔍 הודעה מטלגרם...")
+        msg = await get_latest_message()
 
-            # הוספת שעה וטקסט פתיחה
-            time_prefix = f"בורסה פון השעה {get_server_time()}. "
-            full_text = time_prefix + current
+        now = datetime.datetime.now()
+        weekday = {
+            "Sunday": "יום ראשון", "Monday": "יום שני", "Tuesday": "יום שלישי",
+            "Wednesday": "יום רביעי", "Thursday": "יום חמישי",
+            "Friday": "יום שישי", "Saturday": "שבת"
+        }[now.strftime("%A")]
+        time_str = now.strftime("%H:%M").replace(":", " ו")
+        intro = f"{weekday}, השעה {time_str}.\n"
+        full_text = intro + msg
 
-            asyncio.run(create_voice(full_text))
-            wav_file = get_next_filename()
-            convert_to_wav(wav_file)
-            upload_to_yemot(wav_file)
+        filename = get_next_filename()
+        print("🎤 יוצר קובץ קול עם Gemini...")
+        if create_audio(full_text, filename):
+            print("📄 הטקסט שהוקרא:\n" + full_text)
+            print("📤 מעלה לימות...")
+            upload_to_yemot(filename)
         else:
-            print("ℹ️ לא נמצאו הודעות חדשות או שהערוץ ריק.")
+            print("❌ יצירת קול נכשלה.")
     except Exception as e:
-        print("❌ שגיאה:", e)
+        print("🚨 שגיאה:", e)
 
+# =========== הרצה ===========
 if __name__ == "__main__":
-    run_once()
+    asyncio.run(main())
